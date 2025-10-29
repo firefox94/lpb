@@ -1,0 +1,691 @@
+from pyspark.ml import Transformer, Pipeline
+from pyspark.ml.util import DefaultParamsReadable, DefaultParamsWritable
+from pyspark.sql import DataFrame
+from pyspark.ml.feature import StringIndexer, OneHotEncoder, VectorAssembler, Imputer
+from pyspark.ml.classification import RandomForestClassifier
+from synapse.ml.lightgbm import LightGBMClassifier
+from xgboost.spark import SparkXGBClassifier
+from pyspark.ml.evaluation import MulticlassClassificationEvaluator, BinaryClassificationEvaluator
+from pyspark.sql.types import NumericType, ArrayType, DoubleType, BooleanType
+from pyspark.ml.linalg import Vectors, VectorUDT
+import math
+import mlflow
+import mlflow.spark
+import os
+import pyspark
+from pyspark.sql import *
+from pyspark.sql import functions as F
+from pyspark.sql.functions import date_add,col,when
+mlflow.set_tracking_uri("http://10.163.143.39:5000")
+# Trường hợp sử dụng file registry trên MinIO thì cần cập nhật environment
+os.environ["AWS_ENDPOINT_URL"]="https://minioldz.lpbank.com.vn"
+os.environ["AWS_ACCESS_KEY_ID"]="6iOjCBkDNkPFAhzyRAzb"
+os.environ["AWS_SECRET_ACCESS_KEY"]="Uc2PYqhu5jhtl29Eb6ALivBmdh51wDHPtaG8OL42"
+from utils.config_loader import load_config
+config = load_config(common_path= "config/common.yaml",project_path= "config/xln.yaml")
+mile_stone = config.get('mile_stone') 
+
+
+def run_preprocessing():
+    # khach hang vay/thauchi + the
+    query = rf"""
+        WITH cus as 
+            (select DATE_FORMAT(CAST(txn_dt AS DATE),'yyyyMMdd') as txn_dt,
+            cst_no,
+            max(pds_max_rating) as max_cic,
+            FLOOR(MONTHS_BETWEEN(current_date(),TO_DATE(birth_day,'ddMMyyyy'))/12) AS age,
+            sex,
+            phone
+            from hive_prod.landing_ldz.xln_khachhang_v1 where cst_type = 'INDIV' 
+            and txn_dt >= DATE('{mile_stone}')
+            group by DATE_FORMAT(CAST(txn_dt AS DATE),'yyyyMMdd'),
+            cst_no,
+            FLOOR(MONTHS_BETWEEN(current_date(),TO_DATE(birth_day,'ddMMyyyy'))/12),
+            sex,
+            phone
+            ),
+
+        phone as (
+            select phone, count(distinct cst_no) as phone_cnt from hive_prod.landing_ldz.xln_khachhang_v1 where cst_type = 'INDIV' and txn_dt >= DATE('{mile_stone}') group by phone
+            ),
+
+        marial as (
+            select case when length(ext_ref_no_1) = 8 then '8'||ext_ref_no_1 
+                        when ext_ref_no_1 is null then 'Unknown'
+            else ext_ref_no_1 end as cst_no, 
+            marital_status 
+            from hive_prod.ods_stglos.customer
+            where amnd_state = 'F'
+        )
+
+        select txn_dt, cus.cst_no, max(max_cic) as max_cic_kh, age, sex, phone.phone_cnt, marial.marital_status
+        from cus 
+        left join phone on cus.phone = phone.phone
+        left join marial on cus.cst_no = marial.cst_no
+        group by txn_dt, cus.cst_no, age, sex, phone.phone_cnt, marial.marital_status
+    """
+    cus = spark.sql(query)
+
+    # query khoan vay
+    query = rf"""
+        with loan as (
+            select DATE_FORMAT(CAST(txn_dt AS DATE),'yyyyMMdd') as txn_dt,
+            ln_ac_nbr as ln_ac_nbr_loan,
+            cst_no,
+            type_loan,
+            br_cd as branchid_loan,
+            ln_sub_prod_desc as loan_prod,
+            sum(rcy_ost) as sum_rcy_amt,
+            max(rcy_nxt_prin_pmt) as max_rcy_prin_amt,
+            sum(rcy_total_rmn_accr_int) as sum_rcy_int_amt,
+            max(amt_financed) as max_amt_financed_loan,
+            --min(dsbr_date) as min_dsbr_dt,
+            min(cast(ln_prod_cat as int)) as min_loan_term,
+            max(cast(ln_prod_cat as int)) as max_loan_term,
+            max(int_rate) as max_int_rate,
+            max(cast(d_ln_debt_clfn_id as int)) as max_cic_lpb
+            from hive_prod.landing_ldz.xln_khoanvay
+            where txn_dt >= DATE('{mile_stone}') and acy_ost>0
+            group by DATE_FORMAT(CAST(txn_dt AS DATE),'yyyyMMdd'),
+            ln_ac_nbr,
+            cst_no,
+            type_loan,
+            br_cd,
+            ln_sub_prod_desc),
+
+        sched as (
+            select DATE_FORMAT(CAST(txn_dt AS DATE),'yyyyMMdd') as txn_dt,
+            arrangement_nbr,
+            max(lcy_schd_amt) as max_lcy_schd_amt,
+            max(fcy_amt) as max_fcy_amt,
+            max(int_rate) as max_int_rate,
+            min(FLOOR(MONTHS_BETWEEN(TO_DATE(maturity_date,'ddMMyyyy'),TO_DATE(value_date,'ddMMyyyy'))/12)) AS term
+            from hive_prod.ods_smy.payment_schd_stmt
+            where schd_type in ('P','I','F')
+            and txn_dt >= DATE('{mile_stone}')
+            group by txn_dt,arrangement_nbr),
+
+        pd as (
+            select DATE_FORMAT(CAST(txn_dt AS DATE),'yyyyMMdd') as txn_dt,
+            arrangement_nbr,
+            sum(pd_total_bal) as sum_pd_total_bal,
+            sum(pnp_otsnd_payment_amt) as sum_pnp_otsnd_payment_amt,
+            sum(int_otsnd_payment_amt) as sum_int_otsnd_payment_amt,
+            sum(penalty_otsnd_payment_amt) as sum_penalty_otsnd_payment_amt,
+            sum(ps_otsnd_payment_amt) as sum_ps_otsnd_payment_amt,
+            sum(chg_otsnd_payment_amt) as sum_chg_otsnd_payment_amt,
+            sum(comm_otsnd_payment_amt) as sum_comm_otsnd_payment_amt,
+            max(cast(odue_day_nbr as int)) as max_ovd_dt_loan  -- so ngay qua han, = 0 la chua qua han --
+            from hive_prod.conformed.smy_pd_detail where txn_dt >= DATE('{mile_stone}')
+            group by DATE_FORMAT(CAST(txn_dt AS DATE),'yyyyMMdd'),arrangement_nbr),
+
+        sothu as (
+            select DATE_FORMAT(CAST(txn_dt AS DATE),'yyyyMMdd') as txn_dt,
+            cst_no,
+            ln_ac_nbr,
+            sum(paid_principal) as sum_paid_principal,
+            sum(paid_interest) as sum_paid_interest,
+            sum(late_payment_penalty) as sum_late_payment_penalty
+            from hive_prod.landing_ldz.xln_sothu_v1
+            where txn_dt >= DATE('{mile_stone}')
+            group by DATE_FORMAT(CAST(txn_dt AS DATE),'yyyyMMdd'),cst_no,ln_ac_nbr)
+
+        select loan.txn_dt,
+        loan.ln_ac_nbr_loan,
+        loan.cst_no,
+        loan.type_loan,
+        loan.branchid_loan,
+        loan.loan_prod,
+        loan.sum_rcy_amt,
+        loan.max_rcy_prin_amt,
+        loan.sum_rcy_int_amt,
+        loan.max_amt_financed_loan,
+        loan.min_loan_term,
+        loan.max_loan_term,
+        coalesce(loan.max_int_rate,sched.max_int_rate) as max_int_rate,
+        loan.max_cic_lpb,
+        sched.max_lcy_schd_amt,
+        sched.max_fcy_amt,
+        sched.term,
+        pd.sum_pd_total_bal,
+        pd.sum_pnp_otsnd_payment_amt,
+        pd.sum_int_otsnd_payment_amt,
+        pd.sum_penalty_otsnd_payment_amt,
+        pd.sum_ps_otsnd_payment_amt,
+        pd.sum_chg_otsnd_payment_amt,
+        pd.sum_comm_otsnd_payment_amt,
+        pd.max_ovd_dt_loan,
+        sothu.sum_paid_principal,
+        sothu.sum_paid_interest,
+        sothu.sum_late_payment_penalty
+        from loan 
+        LEFT JOIN sched on loan.txn_dt = sched.txn_dt and loan.ln_ac_nbr_loan = sched.arrangement_nbr
+        LEFT JOIN pd on loan.txn_dt = pd.txn_dt and loan.ln_ac_nbr_loan = pd.arrangement_nbr
+        LEFT JOIN sothu on loan.txn_dt = sothu.txn_dt and loan.ln_ac_nbr_loan = sothu.ln_ac_nbr
+    """
+    loan = spark.sql(query)
+    loan = loan.fillna({"max_ovd_dt_loan":0})
+
+    # thau chi + thanh toan
+    query = rf"""
+        with thauchi as (
+            select DATE_FORMAT(CAST(txn_dt AS DATE),'yyyyMMdd') as txn_dt,
+            cst_no,
+            ln_ac_nbr as ln_ac_nbr_thauchi,
+            sum(accrued_interest_amount) as sum_accrued_interest_amount,
+            max(amt_financed) as max_amt_financed_thauchi,
+            avg(FLOOR(MONTHS_BETWEEN(TO_DATE(maturity_date,'ddMMyyyy'),TO_DATE(book_date,'ddMMyyyy'))/12)) AS avg_duration_thauchi,
+            max(coalesce(cast(rate_margin as decimal(10,4)),int_rate)) as max_int_rate_thauchi,
+            br_cd as branchid_thauchi,
+            max(rcy_ost) as max_rcy_ost_thauchi,
+            max(exchanged_interm_prin_amount) as max_exchanged_interm_prin_amount_thauchi
+            from hive_prod.landing_ldz.xln_thauchi_v1
+            where txn_dt >= DATE('{mile_stone}') and acy_ost>0
+            group by DATE_FORMAT(CAST(txn_dt AS DATE),'yyyyMMdd'),cst_no,ln_ac_nbr,br_cd),
+
+        pd as (
+            select DATE_FORMAT(CAST(txn_dt AS DATE),'yyyyMMdd') as txn_dt,
+            arrangement_nbr,
+            sum(pd_total_bal) as sum_pd_total_bal_thauchi,
+            sum(pnp_otsnd_payment_amt) as sum_pnp_otsnd_payment_amt_thauchi,
+            sum(int_otsnd_payment_amt) as sum_int_otsnd_payment_amt_thauchi,
+            sum(penalty_otsnd_payment_amt) as sum_penalty_otsnd_payment_amt_thauchi,
+            sum(ps_otsnd_payment_amt) as sum_ps_otsnd_payment_amt_thauchi,
+            sum(chg_otsnd_payment_amt) as sum_chg_otsnd_payment_amt_thauchi,
+            sum(comm_otsnd_payment_amt) as sum_comm_otsnd_payment_amt_thauchi,
+            max(cast(odue_day_nbr as int)) as max_ovd_dt_thauchi  -- so ngay qua han, = 0 la chua qua han --
+            from hive_prod.conformed.smy_pd_detail where txn_dt >= DATE('{mile_stone}')
+            group by DATE_FORMAT(CAST(txn_dt AS DATE),'yyyyMMdd'),arrangement_nbr)
+
+        select thauchi.*,
+        pd.sum_pd_total_bal_thauchi,
+        pd.sum_pnp_otsnd_payment_amt_thauchi,
+        pd.sum_int_otsnd_payment_amt_thauchi,
+        pd.sum_penalty_otsnd_payment_amt_thauchi,
+        pd.sum_ps_otsnd_payment_amt_thauchi,
+        pd.sum_chg_otsnd_payment_amt_thauchi,
+        pd.sum_comm_otsnd_payment_amt_thauchi,
+        pd.max_ovd_dt_thauchi
+        from thauchi LEFT JOIN pd on thauchi.txn_dt = pd.txn_dt and thauchi.ln_ac_nbr_thauchi = pd.arrangement_nbr
+    """
+    thauchi = spark.sql(query)
+    thauchi = thauchi.fillna({"max_ovd_dt_thauchi":0})
+
+    # thong tin the
+    query = rf"""
+        with the as (
+            select DATE_FORMAT(CAST(txn_dt AS DATE),'yyyyMMdd') as txn_dt,
+            cst_no,
+            card_id,
+            MONTHS_BETWEEN(current_date(),TO_DATE(reg_date,'ddMMyyyy')) AS duration, -- thoi gian mo the den hien tai
+            MONTHS_BETWEEN(TO_DATE(expiry_date,'ddMMyyyy'),TO_DATE(reg_date,'ddMMyyyy')) AS card_term, -- thoi han the
+            max(credit_limit) as max_credit_limit,
+            max(principal_total_amount) as max_prin_total_amt,
+            min(min_amount_due) as min_amt_due,
+            sum(sum_payment_after_invoice_date) as sum_total_payment_amt,
+            sum(interest_amount) as sum_int_amt,
+            sum(total_amount_due) as sum_total_amt_due,
+            max(nbr_ovd_days) as max_ovd_dt_the, -- so ngay qua han tra no the
+            card_type,
+            br_cd as branchid_card
+            from hive_prod.landing_ldz.xln_thetindung
+            where txn_dt >= DATE('{mile_stone}') and principal_total_amount>0
+            group by DATE_FORMAT(CAST(txn_dt AS DATE),'yyyyMMdd'),
+            cst_no,
+            card_id,
+            MONTHS_BETWEEN(current_date(),TO_DATE(reg_date,'ddMMyyyy')),
+            MONTHS_BETWEEN(TO_DATE(expiry_date,'ddMMyyyy'),TO_DATE(reg_date,'ddMMyyyy')),
+            card_type,
+            br_cd),
+
+        sothu as (
+            select DATE_FORMAT(CAST(txn_dt AS DATE),'yyyyMMdd') as txn_dt,
+            cst_no,
+            cast(card_id as string) as card_id,
+            max(total_amount_due) as max_total_amount_due,
+            sum(paid_principal) as sum_paid_principal_card,
+            sum(min_amount_due) as sum_min_amount_due
+            from hive_prod.landing_ldz.xln_sothuthe
+            where txn_dt >= DATE('{mile_stone}') and invoice_date = (select max(invoice_date) from hive_prod.landing_ldz.xln_sothuthe)
+            group by DATE_FORMAT(CAST(txn_dt AS DATE),'yyyyMMdd'), cst_no, cast(card_id as string))
+
+        select the.*,
+        sothu.max_total_amount_due,
+        sothu.sum_paid_principal_card,
+        sothu.sum_min_amount_due
+        from the LEFT JOIN sothu on the.txn_dt = sothu.txn_dt and the.card_id = sothu.card_id and the.cst_no = sothu.cst_no
+    """
+    card = spark.sql(query)
+
+    # add new features
+    query = rf"""
+    WITH all as (
+        select txn_dt, cst_no,
+        vi_pham_lcy_bal,
+        vi_pham_fpd,
+        vi_pham_qua_han_nhieu_lan,
+        khoan_vay_rui_ro,
+        kh_nop_tien_nhieu_lan
+        from hive_prod.sandbox.credit_card_servicing
+
+        UNION ALL
+
+        select txn_dt, cst_no,
+        vi_pham_lcy_bal,
+        vi_pham_fpd,
+        vi_pham_qua_han_nhieu_lan,
+        khoan_vay_rui_ro,
+        kh_nop_tien_nhieu_lan
+        from hive_prod.sandbox.loan_servicing
+
+        UNION ALL
+
+        select txn_dt, cst_no,
+        vi_pham_lcy_bal,
+        vi_pham_fpd,
+        vi_pham_qua_han_nhieu_lan,
+        khoan_vay_rui_ro,
+        kh_nop_tien_nhieu_lan
+        from hive_prod.sandbox.overdraft_servicing
+    )
+
+    select date_format(txn_dt,'yyyyMM') as txn_dt,
+    cst_no,
+    max(vi_pham_lcy_bal) as vi_pham_lcy_bal,
+    max(vi_pham_fpd) as vi_pham_fpd,
+    max(vi_pham_qua_han_nhieu_lan) as vi_pham_qua_han_nhieu_lan,
+    max(khoan_vay_rui_ro) as khoan_vay_rui_ro,
+    max(kh_nop_tien_nhieu_lan) as kh_nop_tien_nhieu_lan
+    from all
+    group by date_format(txn_dt,'yyyyMM'), cst_no
+    """
+    bu = spark.sql(query)
+
+    ### create dataset
+    cus_a = cus.alias("cus")
+    loan_a = loan.alias("loan")
+    thauchi_a = thauchi.alias("thauchi")
+    card_a = card.alias("card")
+    bu_a = bu.alias("bu")
+
+    df = (
+        loan_a
+        .join(
+            thauchi_a, ((col("loan.txn_dt") == col("thauchi.txn_dt")) & (col("loan.cst_no") == col("thauchi.cst_no"))), "outer")
+        .join(
+            card_a, ((col("loan.txn_dt") == col("card.txn_dt")) & (col("loan.cst_no") == col("card.cst_no"))), "outer")
+        .join(
+            cus_a, ((col("loan.txn_dt") == col("cus.txn_dt")) & (col("loan.cst_no") == col("cus.cst_no"))), "inner")
+        .join(
+            bu_a, ((col("loan.txn_dt") == col("bu.txn_dt")) & (col("loan.cst_no") == col("bu.cst_no"))), "left")
+        .select(
+            F.coalesce(col("cus.txn_dt"),col("loan.txn_dt"),col("thauchi.txn_dt"),col("card.txn_dt"),col("bu.txn_dt")).alias("txn_dt"),
+            F.coalesce(col("cus.cst_no"),col("loan.cst_no"),col("thauchi.cst_no"),col("card.cst_no"),col("bu.cst_no")).alias("cst_no"),
+            *[c for c in cus_a.columns if c not in ["txn_dt","cst_no"]],
+            *[c for c in loan_a.columns if c not in ["txn_dt","cst_no"]],
+            *[c for c in thauchi_a.columns if c not in ["txn_dt","cst_no"]],
+            *[c for c in card_a.columns if c not in ["txn_dt","cst_no"]],
+            *[c for c in bu_a.columns if c not in ["txn_dt","cst_no"]])
+    )
+
+    for c in ["max_ovd_dt_loan","max_ovd_dt_thauchi","max_ovd_dt_the"]:
+        df = df.fillna({c:0})
+
+    for c in ["max_cic_kh","max_amt_financed_thauchi"]:
+        df = df.withColumn(c,col(c).cast("double"))
+
+    # nhóm dataset theo đầu thời gian + KH
+    df = df.groupBy('txn_dt','cst_no').agg(
+        F.max('max_cic_kh').alias('max_cic_kh'),
+        F.max('age').alias('age'),
+        F.first('sex',ignorenulls=True).alias('sex'),
+        F.sum('phone_cnt').alias('phone_cnt'),
+        F.countDistinct('ln_ac_nbr_loan').alias('loan_cnt'),
+        F.first('type_loan',ignorenulls=True).alias('type_loan'),
+        F.first('branchid_loan',ignorenulls=True).alias('branchid_loan'),
+        F.first('loan_prod',ignorenulls=True).alias('loan_prod'),
+        F.sum('sum_rcy_amt').alias('sum_rcy_amt'),
+        F.max('max_rcy_prin_amt').alias('max_rcy_prin_amt'),
+        F.sum('sum_rcy_int_amt').alias('sum_rcy_int_amt'),
+        F.max('max_amt_financed_loan').alias('max_amt_financed_loan'),
+        F.min('min_loan_term').alias('min_loan_term'),
+        F.max('max_loan_term').alias('max_loan_term'),
+        F.max('max_int_rate').alias('max_int_rate'),
+        F.max('max_cic_lpb').alias('max_cic_lpb'),
+        F.max('max_lcy_schd_amt').alias('max_lcy_schd_amt'),
+        F.max('max_fcy_amt').alias('max_fcy_amt'),
+        F.max('term').alias('max_term_loan'),
+        F.sum('sum_pd_total_bal').alias('sum_pd_total_bal'),
+        F.sum('sum_pnp_otsnd_payment_amt').alias('sum_pnp_otsnd_payment_amt'),
+        F.sum('sum_int_otsnd_payment_amt').alias('sum_int_otsnd_payment_amt'),
+        F.sum('sum_penalty_otsnd_payment_amt').alias('sum_penalty_otsnd_payment_amt'),
+        F.sum('sum_ps_otsnd_payment_amt').alias('sum_ps_otsnd_payment_amt'),
+        F.sum('sum_chg_otsnd_payment_amt').alias('sum_chg_otsnd_payment_amt'),
+        F.sum('sum_comm_otsnd_payment_amt').alias('sum_comm_otsnd_payment_amt'),
+        F.max('max_ovd_dt_loan').alias('max_ovd_dt_loan'),
+        F.sum('sum_paid_principal').alias('sum_paid_principal'),
+        F.sum('sum_paid_interest').alias('sum_paid_interest'),
+        F.sum('sum_late_payment_penalty').alias('sum_late_payment_penalty'),
+        F.countDistinct('ln_ac_nbr_thauchi').alias('thauchi_cnt'),
+        F.sum('sum_accrued_interest_amount').alias('sum_accrued_interest_amount'),
+        F.max('max_amt_financed_thauchi').alias('max_amt_financed_thauchi'),
+        F.avg('avg_duration_thauchi').alias('avg_duration_thauchi'),
+        F.max('max_int_rate_thauchi').alias('max_int_rate_thauchi'),
+        F.first('branchid_thauchi',ignorenulls=True).alias('branchid_thauchi'),
+        F.max('max_rcy_ost_thauchi').alias('max_rcy_ost_thauchi'),
+        F.max('max_exchanged_interm_prin_amount_thauchi').alias('max_exchanged_interm_prin_amount_thauchi'),
+        F.sum('sum_pd_total_bal_thauchi').alias('sum_pd_total_bal_thauchi'),
+        F.sum('sum_pnp_otsnd_payment_amt_thauchi').alias('sum_pnp_otsnd_payment_amt_thauchi'),
+        F.sum('sum_int_otsnd_payment_amt_thauchi').alias('sum_int_otsnd_payment_amt_thauchi'),
+        F.sum('sum_penalty_otsnd_payment_amt_thauchi').alias('sum_penalty_otsnd_payment_amt_thauchi'),
+        F.sum('sum_ps_otsnd_payment_amt_thauchi').alias('sum_ps_otsnd_payment_amt_thauchi'),
+        F.sum('sum_chg_otsnd_payment_amt_thauchi').alias('sum_chg_otsnd_payment_amt_thauchi'),
+        F.sum('sum_comm_otsnd_payment_amt_thauchi').alias('sum_comm_otsnd_payment_amt_thauchi'),
+        F.max('max_ovd_dt_thauchi').alias('max_ovd_dt_thauchi'),
+        F.countDistinct('card_id').alias('card_cnt'),
+        F.max('duration').alias('max_card_duration'),
+        F.max('card_term').alias('max_card_term'),
+        F.max('max_credit_limit').alias('max_credit_limit'),
+        F.max('max_prin_total_amt').alias('max_prin_total_amt'),
+        F.min('min_amt_due').alias('min_amt_due'),
+        F.sum('sum_total_payment_amt').alias('sum_total_payment_amt'),
+        F.sum('sum_int_amt').alias('sum_int_amt'),
+        F.sum('sum_total_amt_due').alias('sum_total_amt_due'),
+        F.max('max_ovd_dt_the').alias('max_ovd_dt_the'),
+        F.first('card_type',ignorenulls=True).alias('card_type'),
+        F.first('branchid_card',ignorenulls=True).alias('branchid_card'),
+        F.max('max_total_amount_due').alias('max_total_amount_due'),
+        F.sum('sum_paid_principal_card').alias('sum_paid_principal_card'),
+        F.sum('sum_min_amount_due').alias('sum_min_amount_due'),
+        F.max('vi_pham_lcy_bal').alias('vi_pham_lcy_bal'),
+        F.max('vi_pham_fpd').alias('vi_pham_fpd'),
+        F.max('vi_pham_qua_han_nhieu_lan').alias('vi_pham_qua_han_nhieu_lan'),
+        F.max('khoan_vay_rui_ro').alias('khoan_vay_rui_ro'),
+        F.max('kh_nop_tien_nhieu_lan').alias('kh_nop_tien_nhieu_lan')
+    )
+
+    # Lọc data theo các loại loan/thauchi/the quá hạn từ 0-9 ngày
+    df = df.filter(
+        ((col("max_ovd_dt_loan").between(0,9)) | (col("max_ovd_dt_thauchi").between(0,9)) | (col("max_ovd_dt_the").between(0,9)))
+    )
+
+    df = df.withColumn(
+        "dpd0",
+        when((col("max_ovd_dt_loan") > 0) | (col("max_ovd_dt_thauchi") > 0) | (col("max_ovd_dt_the") > 0), 1).otherwise(0)
+    )
+
+    # label (tạo nhãn theo điều kiện quan sát 9 ngày tiếp theo có DPD > 0)
+    from pyspark.sql import Window
+    df = df.withColumn("txn_date",F.to_date(col("txn_dt"),"yyyyMMdd"))
+
+    w = (
+        Window
+        .partitionBy("cst_no")
+        .orderBy(col("txn_date").cast("long"))
+        .rangeBetween(1,9)
+    )
+
+    df = df.withColumn("label",F.max("dpd0").over(w))
+
+    ### thêm một số biến phái sinh
+    w0 = Window.partitionBy("cst_no").orderBy("txn_date")
+
+    # add bao nhieu ngay KH ko tre han lien tuc
+    df = df.withColumn(
+        "dpd_group",
+        F.sum(when(col("dpd0")>0,1).otherwise(0)).over(w0)
+    )
+
+    w_grp = Window.partitionBy("cst_no","dpd_group").orderBy("txn_date")
+
+    df = df.withColumn(
+        "consec_dpd0",
+        when(col("dpd0")==0,F.row_number().over(w_grp)-1).otherwise(0)
+    )
+
+    # add days since last DPD>0
+    df = df.withColumn("last_dpd_pos_date",when(col("dpd0")>0,col("txn_date")).otherwise(None))
+    df = df.withColumn("last_dpd_pos_date",F.last("last_dpd_pos_date", ignorenulls=True).over(w0.rowsBetween(Window.unboundedPreceding, -1)))
+    df = df.withColumn("days_since_last_dpd",F.datediff(col("txn_date"),col("last_dpd_pos_date")))
+
+    spark.sql("DROP TABLE IF EXISTS hive_prod.sandbox.xln_dataset") # drop if exists
+
+    data.writeTo("hive_prod.sandbox.customer_reactive")\
+        .tableProperty("write.format.default","parquet")\
+        .tableProperty("location","s3a://lpb-dna/silver/sandbox/xln_dataset")\
+        .partitionedBy("txn_dt")\
+        .createOrReplace()
+
+class ValueCountEncoder(Transformer, DefaultParamsReadable, DefaultParamsWritable):
+    def __init__(self, inputCol=None, outputCol=None):
+        super(ValueCountEncoder, self).__init__()
+        self.inputCol = inputCol
+        self.outputCol = outputCol
+        self.counts = None
+
+    def _fit(self, dataset: DataFrame):
+        self.counts = (
+            dataset.groupBy(self.inputCol).count().withColumnRenamed("count",f"{self.inputCol}_vc")
+        )
+        return self
+
+    def _transform(self, dataset: DataFrame):
+        if self.counts is None:
+            self.counts = (
+                dataset.groupBy(self.inputCol).count().withColumnRenamed("count",f"{self.inputCol}_vc")
+            )
+        return dataset.join(self.counts, on=self.inputCol, how="left").withColumnRenamed(f"{self.inputCol}_vc", self.outputCol)
+
+def clean_vector(v):
+    arr = [0.0 if (x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x)))) else x for x in v]
+    return Vectors.dense(arr)
+clean_vector_udf = F.udf(clean_vector, VectorUDT())
+
+class CleanvectorTransformer(Transformer):
+    def __init__(self, inputCol="raw_features", outputCol="features"):
+        super(CleanvectorTransformer, self).__init__()
+        self.inputCol = inputCol
+        self.outputCol = outputCol
+
+    def _transform(self,df):
+        return df.withColumn(self.outputCol, clean_vector_udf(col(self.inputCol)))
+
+# custom config
+train = train
+test = test
+experiment_name = experiment_name # name of experiment, auto append new models result into this
+
+def run_modeling():
+    query = """
+        SELECT * FROM hive_prod.sandbox.xln_dataset
+    """
+    df = spark.sql(query)
+
+    ### pipeline workflow ###
+    cols_vc = ["branchid_loan","branchid_thauchi","branchid_card"]
+    cat_cols = ["sex","type_loan","loan_prod","card_type"]
+    drop_cols = ["txn_dt","cst_no","max_ovd_dt_loan","max_ovd_dt_thauchi","max_ovd_dt_the","dpd0","txn_date","date_long","dpd_bucket","prev_bucket","dpd_group","last_dpd_pos_date"]
+    label_col = "label"
+    oth_cols = [f.name for f in df.schema.fields if isinstance(f.dataType, NumericType) and f.name not in (cols_vc+cat_cols+drop_cols+[label_col])]
+
+    for x in cat_cols:
+        df = df.fillna({x:"Unknown"})
+
+    for c in oth_cols:
+        df = df.withColumn(c, 
+            when(col(c).isNull(),0)\
+        .when(F.isnan(c),0)\
+        .when(col(c)==float("inf"),0)\
+        .when(col(c)==float("-inf"),0)\
+        .when((col(c)=="NaN")|(col(c)=="null")|(col(c)==""),0)\
+        .otherwise(col(c))
+        )
+
+    stages = []
+    # value count encoding
+    for c in cols_vc:
+        stages.append(ValueCountEncoder(inputCol=c, outputCol=f"{c}_vc"))
+
+    # onehot encoding
+    for c in cat_cols:
+        indexer = StringIndexer(inputCol=c, outputCol=f"{c}_idx", handleInvalid="keep")
+        encoder = OneHotEncoder(inputCol=f"{c}_idx", outputCol=f"{c}_ohe")
+        stages += [indexer,encoder]
+
+    # imputer
+    imputer = Imputer(
+        inputCols = oth_cols,
+        outputCols = [f"{c}_imp" for c in oth_cols]
+    )
+    stages.append(imputer)
+
+    # feature assembler
+    feature_cols = [f"{c}_vc" for c in cols_vc] + [f"{c}_ohe" for c in cat_cols] + [f"{c}_imp" for c in oth_cols]
+    assembler = VectorAssembler(inputCols=feature_cols, outputCol="raw_features", handleInvalid="keep")
+    stages.append(assembler)
+    stages.append(CleanvectorTransformer(inputCol="raw_features",outputCol="features"))
+    preprocessor = Pipeline(stages=stages)
+
+    train_df = df.filter((col("dpd0")==0) & (F.substring(col("txn_dt"),1,6).isin(train))).drop("max_ovd_dt_loan","max_ovd_dt_thauchi","max_ovd_dt_the","dpd0","txn_date","date_long","dpd_bucket","prev_bucket","dpd_group","last_dpd_pos_date") 
+    test_df = df.filter((col("dpd0")==0) & (F.substring(col("txn_dt"),1,6).isin(test))).drop("max_ovd_dt_loan","max_ovd_dt_thauchi","max_ovd_dt_the","dpd0","txn_date","date_long","dpd_bucket","prev_bucket","dpd_group","last_dpd_pos_date")
+
+    # scale target for imbalance
+    class_cnt = test_df.groupBy("label").agg(F.countDistinct("cst_no").alias("countdistinct_customer")).collect()
+    dict_cnt = {row["label"]: row["countdistinct_customer"] for row in class_cnt}
+    neg = dict_cnt.get(0,1)
+    pos = dict_cnt.get(1,1)
+    scale = neg / pos
+
+    # # single model
+    # xgb = SparkXGBClassifier(
+    #     features_col = "features",
+    #     label_col = label_col,
+    #     eval_metric="logloss",
+    #     scale_pos_weight= scale,
+    #     num_workers=32
+    # )
+    # # repartition 
+    # train_df = train_df.repartitionByRange(32*4, "txn_dt", "cst_no")
+    # pipeline = Pipeline(stages=[preprocessor,xgb])
+    # model_xgb_label = pipeline.fit(train_df)
+
+    # log mlflow
+    def get_model(model_type):
+        if model_type == "RandomForest":
+            return RandomForestClassifier(
+                featuresCol="features",
+                labelCol=label_col,
+                numTrees=100,
+                maxDepth=10,
+                # num_workers=32
+            )
+        elif model_type == "XGBoost":
+            return SparkXGBClassifier(
+                feature_cols="features",
+                label_col=label_col,
+                eval_metric="logloss",
+                scale_pos_weight=scale,
+                num_workers=32
+            )
+        elif model_type == "LightGBM":
+            return LightGBMClassifier(
+                featuresCol="features",
+                labelCol=label_col,
+                boosting="gbdt",
+                objective="binary",
+                metric="binary_logloss",
+                scale_pos_weight=scale,
+                num_workers=32
+            )
+        else:
+            raise ValueError(f"Unknown model type: {model_type}")
+
+    # mlflow
+    mlflow.set_experiment("hanbv-xln-v1")
+
+    def train_log(model_type,train_df,test_df):
+        model = get_model(model_type)
+
+        # repartition 
+        train_df = train_df.repartitionByRange(32*4, "txn_dt", "cst_no")
+        pipeline = Pipeline(stages=[preprocessor,model])
+        
+        # log metrics
+        # mlflow.pyspark.ml.autolog()   # add auto log, remove if not run as expected
+        with mlflow.start_run(run_name=model_type):
+            model_pipeline = pipeline.fit(train_df)
+            preds = model_pipeline.transform(test_df.repartitionByRange(32*4, "txn_dt", "cst_no"))
+
+            evaluator = BinaryClassificationEvaluator(
+                rawPredictionCol="rawPrediction",
+                labelCol=label_col,
+                metricName="areaUnderROC"
+            )
+            auc = evaluator.evaluate(preds)
+
+            evaluator_multi = MulticlassClassificationEvaluator(
+                labelCol=label_col,
+                predictionCol="prediction",
+                metricName="accuracy"
+            )
+            accuracy = evaluator_multi.evaluate(preds)
+
+            evaluator_multi.setMetricName("f1")
+            f1 = evaluator_multi.evaluate(preds)
+
+            evaluator_multi.setMetricName("weightedPrecision")
+            precision = evaluator_multi.evaluate(preds)
+
+            evaluator_multi.setMetricName("weightedRecall")
+            recall = evaluator_multi.evaluate(preds)
+
+            mlflow.log_metric("accuracy",accuracy)
+            mlflow.log_metric("f1",f1)
+            mlflow.log_metric("precision",precision)
+            mlflow.log_metric("recall",recall)
+            mlflow.log_metric("AUC",auc)
+
+            # log params
+            if model_type == "RandomForest":
+                mlflow.log_param("numTrees",model.getNumTrees)
+                mlflow.log_param("maxDepth",model.getOrDefault("maxDepth"))
+            elif model_type == "XGBoost":
+                mlflow.log_param("eval_metric","logloss")
+                mlflow.log_param("scale_pos_weight",scale)
+            elif model_type == "LightGBM":
+                mlflow.log_param("boosting","gbdt")
+                mlflow.log_param("objective","binary")
+                mlflow.log_param("metric","binary_logloss")
+                mlflow.log_param("scale_pos_weight",scale)
+
+            # log models
+            mlflow.spark.log_model(model_pipeline,artifact_path=f"{model_type}_model")
+
+        # run
+        for model_type in ["RandomForest", "XGBoost", "LightGBM"]:
+            train_log(model_type,train_df,test_df)
+
+def run_predict():
+    # get predict data
+    query = """
+        SELECT * FROM hive_prod.sandbox.xln_dataset
+    """
+    df = spark.sql(query)
+    preds_data = df.filter((col("dpd0")==0) & (F.substring(col("txn_dt"),1,6).isin(month))).drop("max_ovd_dt_loan","max_ovd_dt_thauchi","max_ovd_dt_the","dpd0","txn_date","prev_bucket","date_long","dpd_bucket","dpd_group","last_dpd_pos_date")
+    
+    # get model from mlflow
+    model = get_model(model_name,run_id)
+    preds = model.transform(preds_data.repartitionByRange(32*4, "txn_dt", "cst_no"))
+
+    ### export predict lead
+    result = preds.filter(col('prediction')==1).select('cst_no','probability','prediction')
+
+    vector_to_double = udf(lambda v: float(v[1]) if v is not None else None, DoubleType())
+    result = result.withColumn("proba_1",vector_to_double(col("probability"))).select('cst_no','proba_1','prediction').orderBy(col("proba_1").desc())
+
+    result.writeTo("hive_prod.sandbox.xln_lead_test")\
+        .tableProperty("write.format.default","parquet")\
+        .tableProperty("location","s3a://lpb-dna/silver/sandbox/xln_lead_test")\
+        .partitionedBy("prediction")\
+        .createOrReplace()
+

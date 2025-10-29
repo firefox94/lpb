@@ -1,0 +1,681 @@
+import pyspark
+from pyspark.sql import *
+from pyspark.sql import functions as F
+from pyspark.sql.functions import date_add,col,when
+import warnings
+warnings.filterwarnings('ignore')
+import duckdb
+import os
+from utils.config_loader import load_config
+config = load_config(common_path= "config/common.yaml",project_path= "config/reactive.yaml")
+max_login_time = config.get('max_login_time') 
+month = config.get('month')
+
+# GLOBAL CONFIG
+mlflow.set_tracking_uri("http://10.163.143.39:5000")
+client = MlflowClient()
+spark = SparkSession.builder.remote("sc://10.160.143.16:15002").getOrCreate()
+fs=s3fs.S3FileSystem(key='n8ZXuJ4jJfayLXWVoKwN',
+                     secret='k9fu7OFi11iPXlq82dg1woHgrtB38jmDIcKi4DMS',
+                     client_kwargs={'endpoint_url': "http://dc-minio.lpbank.com.vn"})
+# Establish connection using jaydebeapi
+jdbc_url = 'jdbc:oracle:thin:@//landingzone-scan.lpbank.com.vn:1521/LDZDB'  
+jdbc_driver_name = 'oracle.jdbc.OracleDriver'
+jdbc_driver_loc = r'/data01/notebooks/trangqh_propensity_cc/ojdbc8.jar'  
+username = 'DAD'
+password = 'LdzDad#Jan26'
+conn = jaydebeapi.connect(
+    "oracle.jdbc.driver.OracleDriver",
+    jdbc_url,
+    [username, password],
+    jars=jdbc_driver_loc
+)
+ 
+# Create a cursor object
+cursor = conn.cursor()
+
+#####
+def get_model(model_name,run_id):
+    model = mlflow.sklearn.load_model(f"runs:/{run_id}/{model_name}")
+    return model
+
+def _batch_insert(cursor, sql , data, batch_size=100000):
+            for i in range(0, len(data), batch_size):
+                chunks = data[i : i + batch_size]
+                cursor.executemany(sql, chunks)
+
+
+def run_preprocessing():
+    # customer login info
+    query = f"""WITH CUS1 AS (
+    SELECT C.CUSTOMER_NO
+    ,D.DURATION
+    ,C.LOGIN_LV24H
+    FROM hive_prod.landing_stg.stglv24_all_customer C
+    LEFT JOIN 
+    (SELECT DISTINCT CUST_NO
+    ,(unix_timestamp(INSERT_TIME) - unix_timestamp(LOGIN_TIME)) / 60 AS DURATION
+    FROM hive_prod.landing_hstg.stglv24_login_user_history 
+    WHERE CHANNEL = 'E_MOBILE'
+    ) D
+    ON C.CUSTOMER_NO = D.CUST_NO
+    WHERE (CAST(LOGIN_LV24H AS DATE) BETWEEN DATE('2024-01-01') AND DATE('{max_login_time}') - 90) -- lấy các KH có thời gian login từ 2024 đến cách hiện tại 3 tháng
+    AND (CAST(LINK_ACCOUNT_DATE AS DATE) BETWEEN DATE('2024-01-01') AND DATE('{max_login_time}') - 90)  -- lấy các KH có thời gian login từ 2024 đến cách hiện tại 3 tháng
+    ),
+
+    CUS2 AS (
+    SELECT DISTINCT cc.CUST_NO
+    , FLOOR(MONTHS_BETWEEN(current_date(),TO_DATE(ECI.DOB,'ddMMyyyy'))/12) AS AGE
+    , CASE WHEN ECID.GENDER = 'Nam' THEN 'M' ELSE 'F' END AS GENDER
+    , MONTHS_BETWEEN(current_date(),SVAC.ACTIVE_DATE) AS CREATE_DURATION
+    , CASE WHEN DB.BR_CD IS NULL then cc.CIF_BRANCH ELSE DB.BR_CD END AS BR_CD
+    FROM hive_prod.landing_stg.stglv24_core_customer cc  
+    LEFT JOIN (select distinct CUSTOMER_NO,ACTIVE_DATE FROM hive_prod.landing_stg.stglv24_all_customer) svac -- lấy ngày active để tính thời gian từ lúc tạo cus đến hiện tại
+    ON cc.CUST_NO = SVAC.CUSTOMER_NO 
+    INNER JOIN (select distinct ID_NUMBER,CUSTOMER_NO,DOB FROM hive_prod.landing_stg.stgapi_eid_card_info WHERE LENGTH(DOB) = 8) ECI -- dùng bảng này để lấy thông tin ngày tháng năm sinh
+    ON svac.CUSTOMER_NO = ECI.CUSTOMER_NO 
+    INNER JOIN (select distinct ID_NUMBER,GENDER FROM hive_prod.landing_stg.stgapi_eid_card_info_detail) ecid -- dùng bảng này để lấy thông tin giới tính
+    ON ECI.ID_NUMBER = ecid.ID_NUMBER 
+    LEFT JOIN (select distinct ALT_BR_CD,BR_CD FROM hive_prod.landing_ldz.dim_branch) db -- bảng này để lấy thông tin mã chi nhánh tương ứng với customer
+    ON db.ALT_BR_CD = cc.CIF_BRANCH
+    WHERE cc.SYSTEM_ID = 'COREBANK'
+    ),
+
+    CUS3 AS (
+    SELECT DISTINCT CUST_NO,CIF_NO FROM hive_prod.landing_stg.stglv24_core_customer -- lấy thông tin mapping giữa số CUST_NO và CIF_NO
+    ),
+
+    CUS4 AS (
+    select distinct CST_NO,
+    FLOOR(MONTHS_BETWEEN(current_date(),CAST(CRT_DT AS DATE))/12) AS CREATE_DURATION,
+    PRIM_BR_NBR,
+    FLOOR(MONTHS_BETWEEN(current_date(),CAST(BRTH_DT AS DATE))/12) AS AGE,
+    GND 
+    FROM hive_prod.landing_ldz.cst_dim
+    WHERE DEATH_MARK_DT IS NULL -- Chua chet 
+    AND IN_USE_STATUS = 1
+    ) -- bảng CUS4 này lấy thông tin thời gian tạo cus đến hiện tại, giới tính, tuổi của KH trên core, mục đích là nếu các thông tin này trên phần CUS2 null thì sẽ lấy ở đây
+
+    select 
+    CUS3.CIF_NO AS CST_NO,
+    MAX(COALESCE(CUS2.AGE,CUS4.AGE)) AS AGE,
+    MAX(COALESCE(CUS2.GENDER,CUS4.GND)) AS GENDER,
+    MAX(CUS1.DURATION) AS MAX_DURATION,
+    SUM(CUS1.DURATION) AS SUM_DURATION,
+    MAX(CASE WHEN CUS2.CREATE_DURATION >= CUS4.CREATE_DURATION THEN CUS2.CREATE_DURATION ELSE CUS4.CREATE_DURATION END) AS CREATE_DURATION,
+    MAX(COALESCE(CUS2.BR_CD,CUS4.PRIM_BR_NBR)) AS BRANCHID
+    FROM CUS1
+    LEFT JOIN CUS2 ON CUS1.CUSTOMER_NO = CUS2.CUST_NO
+    LEFT JOIN CUS3 ON CUS1.CUSTOMER_NO = CUS3.CUST_NO
+    LEFT JOIN CUS4 ON CUS3.CIF_NO = CUS4.CST_NO
+    GROUP BY CUS3.CIF_NO
+    """
+    cus = spark.sql(query)
+
+    # label
+    query = f"""
+    WITH month_list as (
+        -- Sinh cac tháng quan sát giả định, sau đó join với customer để tạo bảng thông tin có số cus theo từng tháng
+        select date_format(add_months(to_date('2025-01-01','yyyy-MM-dd'), i),'yyyyMM') as YEARMONTH
+        FROM (select posexplode(sequence(0,8)) as (i,x))
+    ),
+
+    cus_month as (
+        -- Lấy thông tin từ bảng giao dịch, sau đó join vào tháng đã tạo bên trên
+        select distinct
+        c.CUST_NO,
+        m.YEARMONTH,
+        --MAX(SUM_AMOUNT_TRANSFER) AS AMT_TRANS,
+        to_date(concat(m.YEARMONTH,'01'),'yyyyMMdd') AS MONTH_START_DT
+        FROM hive_prod.landing_hstg.stglv24_sum_trans_acc_product_day_hist c
+        CROSS JOIN month_list m
+        WHERE TRANS_STATUS = 'S' AND CAST(txn_dt AS DATE) BETWEEN DATE('2025-01-01') AND DATE('{max_login_time}')
+        --GROUP BY c.CUST_NO,m.YEARMONTH,to_date(concat(m.YEARMONTH,'01'),'yyyyMMdd')
+    ),
+
+    labelled as (
+        select
+        cm.CUST_NO,
+        cm.YEARMONTH,
+        CASE WHEN 
+            EXISTS (select 1 from hive_prod.landing_hstg.stglv24_sum_trans_acc_product_day_hist t 
+            where TRANS_STATUS = 'S' AND CAST(txn_dt AS DATE) BETWEEN DATE('2025-01-01') AND DATE('{max_login_time}')
+            AND t.CUST_NO = cm.CUST_NO AND CAST(t.SUM_DATE AS DATE) BETWEEN cm.MONTH_START_DT - 90 AND cm.MONTH_START_DT - 1)
+        THEN 0  -- KH có phát sinh GD trong 90 ngày gần nhất
+            WHEN 
+            EXISTS (select 1 from hive_prod.landing_hstg.stglv24_sum_trans_acc_product_day_hist t2
+            where TRANS_STATUS = 'S' AND CAST(txn_dt AS DATE) BETWEEN DATE('2025-01-01') AND DATE('{max_login_time}')
+            AND t2.CUST_NO = cm.CUST_NO AND CAST(t2.SUM_DATE AS DATE) BETWEEN cm.MONTH_START_DT AND cm.MONTH_START_DT + 30)
+        THEN 1  -- KH ko có phát sinh GD trong 90 ngày gần nhất nhưng trong 30 ngày tiếp theo thì có phát sinh
+        ELSE 0 END AS LABEL
+        FROM cus_month cm
+    )
+
+    select 
+    CC.CIF_NO as CST_NO,
+    labelled.YEARMONTH,
+    labelled.LABEL
+    FROM labelled
+    LEFT JOIN
+    (SELECT DISTINCT CUST_NO,CIF_NO FROM hive_prod.landing_stg.stglv24_core_customer) CC
+    ON labelled.CUST_NO = CC.CUST_NO
+    """
+    label = spark.sql(query)
+
+    # get label into customer
+    label_true = label.filter(col('YEARMONTH').isin(['202504','202505','202506','202507','202508'])) # Chỉ lấy dữ liệu nhãn từ tháng 4 vì chỉ có từ tháng 4 mới đủ 3 tháng trc quan sát ko phát sinh GD
+    dim_cus = cus.join(label_true, on='CST_NO', how='inner')
+    dim_cus = dim_cus.groupBy('CST_NO','YEARMONTH').agg(
+        F.min('LABEL').alias('LABEL'),
+        F.max('AGE').alias('AGE'),
+        F.first('GENDER').alias('GENDER'),
+        F.max('MAX_DURATION').alias('MAX_DURATION'),
+        F.sum('SUM_DURATION').alias('SUM_DURATION'),
+        F.max('CREATE_DURATION').alias('CREATE_DURATION'),
+        F.first('BRANCHID').alias('BRANCHID')
+    )
+
+    # Get transaction info (Lấy thông tin giao dịch theo từng đầu KH, chỉ cần lấy từ tháng 3 trở đi là dc vì nhãn chỉ có từ tháng 4, nếu có đủ tài nguyên thì chạy bảng giao dịch này từ đầu năm cũng dc)
+    query = f"""
+    SELECT CD.CST_NO,
+    date_format(TXN_DT,'yyyyMM') AS YEARMONTH,
+    SUM(CASE WHEN DRCR_IND = 'CR' THEN 1 ELSE 0 END) AS NO_CR,
+    SUM(CASE WHEN DRCR_IND = 'DR' THEN 1 ELSE 0 END) AS NO_DR,
+    MAX(TXN_AMT_FCY) AS MAX_TXN_AMT_FCY,
+    SUM(TXN_AMT_FCY) AS SUM_TXN_AMT_FCY,
+    count(DISTINCT TXN_REF) AS NO_TRANS
+    FROM hive_prod.landing_ldz.txn_fact TR
+    INNER JOIN
+    (SELECT CST_DIM_ID,CST_NO FROM hive_prod.landing_ldz.cst_dim) CD 
+    ON TR.CST_DIM_ID = CD.CST_DIM_ID
+    WHERE NVL(REVERSAL_MARKER,'unknown') <> 'R'
+    AND CAST(TXN_DT AS DATE) BETWEEN DATE('2025-03-01') AND DATE('{max_login_time}')
+    GROUP BY CD.CST_NO,date_format(TXN_DT,'yyyyMM')
+    """
+    txn = spark.sql(query)
+
+    # DIM LOAN (Lấy các thông tin theo chiều sp vay, theo đầu KH & tháng)
+    df_loan = None
+    for m in month:
+        query = f"""
+            select * from(
+                SELECT A.CST_NO, date_format(TO_DATE('{m}','yyyy-MM-dd'),'yyyyMM') AS YEARMONTH,
+                SUM(CASE WHEN A.AR_STS_IND = 'A' THEN 1 WHEN A.AR_STS_IND = 'L' THEN 0 ELSE 0.5 END) AS LOAN_STATUS,
+                COUNT(DISTINCT CASE WHEN A.LQG_CODE IS NOT NULL THEN A.LQG_CODE ELSE 'X' END) AS LOAN_KIEUTATTOAN,
+                count(DISTINCT A.PD_CODE) AS LOAN_PRODUCT,
+                count(DISTINCT A.CAT_CODE) AS LOAN_CATCODE,
+                count(DISTINCT A.AC_AR_CODE) AS LOAN_TOTAL_LD,
+                MIN(MONTHS_BETWEEN(A.MAT_DT,FRST_DSBR_DT)/12) AS LOAN_MIN_DURATION,
+                MAX(MONTHS_BETWEEN(A.MAT_DT,FRST_DSBR_DT)/12) AS LOAN_MAX_DURATION,
+                MIN(A.FRST_DSBR_AMT) AS LOAN_MIN_DSBR_AMT,
+                MAX(A.FRST_DSBR_AMT) AS LOAN_MAX_DSBR_AMT,
+                COUNT(DISTINCT B.LN_ALT_AC_NBR) AS LOAN_TOTAL_ACC,
+                MAX(B.NBR_ODUE_DYS) AS LOAN_MAX_ODUE_DYS,
+                SUM(B.TOTAL_DUE_PNP_AMT_FCY) AS LOAN_SUM_PNP_AMT,
+                SUM(B.TOTAL_DUE_INT_AMT_FCY) AS LOAN_SUM_INT_AMT,
+                MAX(B.INT_RATE) AS LOAN_MAX_INT_RATE,
+                AVG(B.INT_RATE) AS LOAN_AVG_INT_RATE,
+                MAX(C.DEBT_LOAN) AS LOAN_MAX_DEBT_LOAN
+                FROM hive_prod.landing_ldz.LOAN_AR_DIM A
+                INNER JOIN hive_prod.landing_ldz.LN_AR_ANL_FCT B ON A.LOAN_AR_DIM_ID = B.LOAN_AR_DIM_ID
+                INNER JOIN (SELECT DISTINCT CST_NO,DEBT_LOAN FROM hive_prod.landing_ldz.CST_DEBT_GROUP_FCT WHERE ETL_DATE <= '{m}') C ON A.CST_NO = C.CST_NO
+                WHERE A.CST_NO IS NOT NULL AND A.eff_fr_dt <= '{m}' AND A.eff_to_dt > '{m}'
+                GROUP BY A.CST_NO, date_format(TO_DATE('{m}','yyyy-MM-dd'),'yyyyMM')
+            ) D"""
+        df_chunk = spark.sql(query)
+        if df_loan is None:
+            df_loan = df_chunk
+        else:
+            df_loan = df_loan.unionByName(df_chunk)
+
+    df_loan = df_loan.persist()
+    df_loan = df_loan.dropDuplicates()
+    df_loan = df_loan.withColumn('LOAN_MAX_DEBT_LOAN',col('LOAN_MAX_DEBT_LOAN').cast('double'))
+    df_loan = df_loan.withColumn('LOAN_SUM_INT_AMT',col('LOAN_SUM_INT_AMT').cast('double'))
+
+    # DIM CASA (Lấy các thông tin theo chiều sp casa, theo đầu KH & tháng)
+    df_casa = None
+    for m in month:
+        query = f""" SELECT * FROM (
+        WITH A AS (
+        -- Lấy thông tin theo bảng dep_ar_dim, chỉ đơn giản là nhóm theo đầu KH và số id để làm key join
+        SELECT CST_NO, date_format(TO_DATE('{m}','yyyy-MM-dd'),'yyyyMM') AS YEARMONTH,
+        CAST(DEP_AR_DIM_ID AS VARCHAR(50)) AS ARID,
+        MAX(CASE WHEN ACC_SPEC_F = 'Y' THEN 1 ELSE 0 END) AS CASA_TK_DEP,
+        SUM(CASE WHEN AC_STATUS = 'OPEN' THEN 3 WHEN AC_STATUS = 'CUR' THEN 2 WHEN AC_STATUS = 'LIQ' THEN 1 WHEN AC_STATUS = 'DORMANT' THEN -1 ELSE 0 END) AS CASA_ACC_STATUS,
+        count(DISTINCT AR_CODE) AS CASA_TOTAL_ACC,
+        SUM(CASE WHEN AR_TP = 'AZ' THEN 1 WHEN AR_TP = 'AC' THEN 0 WHEN AR_TP = 'LD' THEN -1 END) AS CASA_TYPE,
+        MAX(CASE WHEN SERIAL_IND = 'Y' THEN 1 ELSE 0 END) AS CASA_SO_TIET_KIEM,
+        MAX(CASE WHEN CHK_IND = 'Y' THEN 1 ELSE 0 END) AS CASA_CHEQUE,
+        MAX(CASE WHEN END_DT IS NULL THEN MONTHS_BETWEEN(current_date(),CAST(CRT_DT AS DATE))/12 ELSE MONTHS_BETWEEN(CAST(END_DT AS DATE),CAST(CRT_DT AS DATE))/12 END) AS CASA_MAX_DURATION,
+        MAX(CASE WHEN AUTO_RENEWABLE_IND = 'Y' THEN 1 ELSE 0 END) AS CASA_MAX_AUTORENEW,
+        SUM(INL_AMT) AS CASA_SUM_INTAMT
+        FROM hive_prod.landing_ldz.dep_ar_dim
+        WHERE eff_fr_dt <= '{m}' AND eff_to_dt > '{m}'
+        GROUP BY CST_NO,CAST(DEP_AR_DIM_ID AS VARCHAR(50)),
+        date_format(TO_DATE('{m}','yyyy-MM-dd'),'yyyyMM')
+        ),
+
+        B AS
+        -- Lấy thông tin theo bảng fct, cũng chỉ là nhóm theo đầu id để làm key join
+        (SELECT
+        CAST(CST_DIM_ID AS VARCHAR(50)) AS CUSID,
+        MAX(TERM_CODE) AS CASA_TERM_CODE,
+        MAX(CLS_BAL_AMT_TDY_FCY) AS CASA_MAX_BAL_AMT_FCY,
+        SUM(CLS_BAL_AMT_TDY_FCY) AS CASA_SUM_BAL_AMT_FCY,
+        MAX(CLS_BAL_AMT_TDY_LCY) AS CASA_MAX_BAL_AMT_LCY,
+        SUM(CLS_BAL_AMT_TDY_LCY) AS CASA_SUM_BAL_AMT_LCY
+        FROM hive_prod.landing_ldz.dep_ar_anl_fct WHERE CAST(TXN_DT AS DATE) <= '{m}'
+        GROUP BY
+        CAST(CST_DIM_ID AS VARCHAR(50))
+        ),
+
+        C AS 
+        -- Tạo bảng mapping giữa 2 key join
+        (SELECT CAST(DEP_AR_DIM_ID AS VARCHAR(50)) AS ARID, CAST(CST_DIM_ID AS VARCHAR(50)) AS CUSID FROM hive_prod.landing_ldz.dep_ar_anl_fct),
+
+        D AS 
+        -- Tạo bảng mapping giữa 2 key join
+        (SELECT B.*, C.ARID FROM B INNER JOIN C ON B.CUSID = C.CUSID)
+
+        SELECT 
+        CST_NO, YEARMONTH,
+        MAX(CASA_TK_DEP) AS CASA_TK_DEP,
+        SUM(CASA_ACC_STATUS) AS CASA_ACC_STATUS,
+        SUM(CASA_TOTAL_ACC) AS CASA_TOTAL_ACC,
+        SUM(CASA_TYPE) AS CASA_TYPE,
+        MAX(CASA_SO_TIET_KIEM) AS CASA_SO_TIET_KIEM,
+        MAX(CASA_CHEQUE) AS CASA_CHEQUE,
+        MAX(CASA_MAX_DURATION) AS CASA_MAX_DURATION,
+        MAX(CASA_MAX_AUTORENEW) AS CASA_MAX_AUTORENEW,
+        SUM(CASA_SUM_INTAMT) AS CASA_SUM_INTAMT,
+        MAX(D.CASA_TERM_CODE) AS CASA_TERM_CODE,
+        MAX(D.CASA_MAX_BAL_AMT_FCY) AS CASA_MAX_BAL_AMT_FCY,
+        SUM(D.CASA_SUM_BAL_AMT_FCY) AS CASA_SUM_BAL_AMT_FCY,
+        MAX(D.CASA_MAX_BAL_AMT_LCY) AS CASA_MAX_BAL_AMT_LCY,
+        SUM(D.CASA_SUM_BAL_AMT_LCY) AS CASA_SUM_BAL_AMT_LCY
+        FROM A INNER JOIN D
+        ON A.ARID = D.ARID
+        GROUP BY CST_NO, YEARMONTH
+        ) tmp
+        """
+        df_chunk = spark.sql(query)
+        if df_casa is None:
+            df_casa = df_chunk
+        else:
+            df_casa = df_casa.unionByName(df_chunk)
+
+    df_casa = df_casa.persist()
+    df_casa = df_casa.dropDuplicates()
+
+    # DIM CARD (Lấy các thông tin theo chiều sp thẻ, theo đầu KH & tháng)
+    df_card = None
+    for m in month:
+        query = f""" SELECT * FROM (
+        WITH A AS (
+        -- Lấy thông tin bảng card dim và nhóm theo đầu KH + tháng
+        SELECT CST_NO, date_format(TO_DATE('{m}','yyyy-MM-dd'),'yyyyMM') AS YEARMONTH,
+        CARD_TP AS CARD_TYPE,
+        COUNT(DISTINCT PD_CODE) AS CARD_PRODUCT_CODE,
+        REISSUE_IND AS CARD_REISSUE,
+        count(DISTINCT CARD_ID) AS CARD_TOTAL,
+        count(DISTINCT AR_NO) AS CARD_TOTAL_ACC,
+        MAX(MONTHS_BETWEEN(CAST(END_DT AS DATE),CAST(START_VAL_DT AS DATE))/12) AS CARD_MAX_DURATION,
+        MIN(MONTHS_BETWEEN(CAST(END_DT AS DATE),CAST(START_VAL_DT AS DATE))/12) AS CARD_MIN_DURATION
+        FROM hive_prod.landing_ldz.card_ar_dim WHERE eff_fr_dt <= '{m}' AND eff_to_dt > '{m}'
+        GROUP BY CST_NO, date_format(TO_DATE('{m}','yyyy-MM-dd'),'yyyyMM'),
+        CARD_TP,
+        REISSUE_IND
+        ),
+
+        C AS
+        -- Lấy thông tin bảng card fct và nhóm theo đầu KH
+        (
+        SELECT CST_NO,
+        SUM(CASE WHEN DEBT_GRP_CODE = 'NORM' THEN 0 
+                WHEN DEBT_GRP_CODE = 'NNO2' THEN 1
+                WHEN DEBT_GRP_CODE = 'NNO3' THEN 2
+                WHEN DEBT_GRP_CODE = 'NNO4' THEN 3
+                WHEN DEBT_GRP_CODE = 'NNO5' THEN 4 ELSE 0 END) AS CARD_DEBT_TYPE,
+        MAX(TERM_BY_DYS) AS CARD_MAX_TERM_BY_DYS,
+        MIN(TERM_BY_DYS) AS CARD_MIN_TERM_BY_DYS,
+        MAX(TERM_BY_MO) AS CARD_MAX_TERM_BY_MO,
+        MIN(TERM_BY_MO) AS CARD_MIN_TERM_BY_MO,
+        MAX(MAT_TO_DYS) AS CARD_MAX_MAT_TO_DYS,
+        MIN(MAT_TO_DYS) AS CARD_MIN_MAT_TO_DYS
+        FROM hive_prod.landing_ldz.card_ar_fct WHERE TXN_DT <= '{m}'
+        GROUP BY
+        CST_NO
+        ),
+        
+        B AS
+        -- Nối bảng C vào theo cst_no nhưng trước đó cần phải tính thêm 2 chỉ số theo đầu card_id ở bảng D, vì thế nên mới phải vòng qua 1 lượt như này nữa
+        (
+        SELECT C.*,D.MAX_PYMTC_TXN_AMT_FCY,D.SUM_PYMTC_TXN_AMT_FCY FROM C
+        INNER JOIN
+            (SELECT PYM.CARD_AR_DIM_ID, CAR.CST_NO,
+            MAX(PYMTC_TXN_AMT_FCY) AS MAX_PYMTC_TXN_AMT_FCY,
+            SUM(PYMTC_TXN_AMT_FCY) AS SUM_PYMTC_TXN_AMT_FCY
+            FROM hive_prod.landing_ldz.pymtc_txn_fct PYM
+            INNER JOIN (SELECT CST_NO,CARD_AR_DIM_ID FROM hive_prod.landing_ldz.card_ar_fct) CAR
+            ON PYM.CARD_AR_DIM_ID = CAR.CARD_AR_DIM_ID
+            WHERE CAR.CST_NO IS NOT NULL
+            GROUP BY PYM.CARD_AR_DIM_ID,CAR.CST_NO) D
+        ON C.CST_NO = D.CST_NO
+        )
+
+        SELECT A.CST_NO, date_format(TO_DATE('{m}','yyyy-MM-dd'),'yyyyMM') AS YEARMONTH,
+        CARD_TYPE,
+        SUM(CARD_PRODUCT_CODE) AS CARD_PRODUCT_CODE,
+        CARD_REISSUE,
+        MAX(B.MAX_PYMTC_TXN_AMT_FCY) AS MAX_PYMTC_TXN_AMT_FCY,
+        SUM(B.SUM_PYMTC_TXN_AMT_FCY) AS SUM_PYMTC_TXN_AMT_FCY,
+        SUM(CARD_TOTAL) AS CARD_TOTAL,
+        SUM(CARD_TOTAL_ACC) AS CARD_TOTAL_ACC,
+        MAX(CARD_MAX_DURATION) AS CARD_MAX_DURATION,
+        MIN(CARD_MIN_DURATION) AS CARD_MIN_DURATION,
+        SUM(B.CARD_DEBT_TYPE) AS CARD_DEBT_TYPE,
+        --MAX(B.CARD_MAX_TERM_BY_DYS) AS CARD_MAX_TERM_BY_DYS,
+        --MIN(B.CARD_MIN_TERM_BY_DYS) AS CARD_MIN_TERM_BY_DYS,
+        MAX(B.CARD_MAX_TERM_BY_MO) AS CARD_MAX_TERM_BY_MO,
+        MIN(B.CARD_MIN_TERM_BY_MO) AS CARD_MIN_TERM_BY_MO,
+        MAX(B.CARD_MAX_MAT_TO_DYS) AS CARD_MAX_MAT_TO_DYS,
+        MIN(B.CARD_MIN_MAT_TO_DYS) AS CARD_MIN_MAT_TO_DYS
+        FROM A INNER JOIN B ON A.CST_NO = B.CST_NO
+        GROUP BY A.CST_NO, date_format(TO_DATE('{m}','yyyy-MM-dd'),'yyyyMM'),CARD_TYPE,CARD_REISSUE
+        ) tmp
+        """
+        df_chunk = spark.sql(query)
+        if df_card is None:
+            df_card = df_chunk
+        else:
+            df_card = df_card.unionByName(df_chunk)
+
+    df_card = df_card.persist()
+    df_card = df_card.dropDuplicates()
+
+    # create dataset (gom tất cả các bảng thành phần vào theo đầu KH + tháng)
+    cus_a = dim_cus.alias('dim_cus')
+    loan_a = df_loan.alias('df_loan')
+    card_a = df_card.alias('df_card')
+    casa_a = df_casa.alias('df_casa')
+    txn_a = txn.alias('txn')
+
+    data = (cus_a
+        .join(
+        loan_a, ((col('dim_cus.CST_NO') == col('df_loan.CST_NO')) & (col('dim_cus.YEARMONTH') == col('df_loan.YEARMONTH'))), 'left')
+        .join(
+            card_a, ((col('dim_cus.CST_NO') == col('df_card.CST_NO')) & (col('dim_cus.YEARMONTH') == col('df_card.YEARMONTH'))), 'left')
+        .join(
+            casa_a, ((col('dim_cus.CST_NO') == col('df_casa.CST_NO')) & (col('dim_cus.YEARMONTH') == col('df_casa.YEARMONTH'))), 'left')
+        .join(
+            txn_a, ((col('dim_cus.CST_NO') == col('txn.CST_NO')) & (col('dim_cus.YEARMONTH') == col('txn.YEARMONTH'))), 'left')
+        .select(
+            F.coalesce(col('dim_cus.CST_NO'),col('df_loan.CST_NO'),col('df_card.CST_NO'),col('df_casa.CST_NO'),col('txn.CST_NO')).alias('CST_NO'),
+            F.coalesce(col('dim_cus.YEARMONTH'),col('df_loan.YEARMONTH'),col('df_card.YEARMONTH'),col('df_casa.YEARMONTH'),col('txn.YEARMONTH').alias('YEARMONTH'),
+            *[c for c in cus_a.columns if c not in ["CST_NO","YEARMONTH"]],
+            *[c for c in loan_a.columns if c not in ["CST_NO","YEARMONTH"]],
+            *[c for c in casa_a.columns if c not in ["CST_NO","YEARMONTH"]],
+            *[c for c in card_a.columns if c not in ["CST_NO","YEARMONTH"]],
+            *[c for c in txn_a.columns if c not in ["CST_NO","YEARMONTH"]])
+    ))
+    data = data.dropDuplicates()
+    data = data.withColumn("ETL_DATE",F.lit(max_login_time).cast("date")) # add ETL_DATE
+
+    ### add some new features
+    window_spec = Window.partitionBy("CST_NO").orderBy("YEARMONTH")
+    # chenh lech thang nay vs thang truoc
+    data = data.withColumn(
+        "CASA_DIFF_1M",
+        col("CASA_MAX_BAL_AMT_LCY") - F.lag("CASA_MAX_BAL_AMT_LCY",1).over(window_spec)
+    )
+
+    data = data.withColumn(
+        "LOAN_DIFF_1M",
+        col("LOAN_MAX_DSBR_AMT") - F.lag("LOAN_MAX_DSBR_AMT",1).over(window_spec)
+    )
+
+    # trung binh 3 thang gan nhat
+    rolling_3m = Window.partitionBy("CST_NO").orderBy("YEARMONTH").rowsBetween(-2,0)
+
+    data = data.withColumn(
+        "CASA_MEAN_3M",
+        F.avg("CASA_MAX_BAL_AMT_LCY").over(rolling_3m)
+    )
+
+    data = data.withColumn(
+        "LOAN_MEAN_3M",
+        F.avg("LOAN_MAX_DSBR_AMT").over(rolling_3m)
+    )
+
+    # tinh xu huong 3 thang gan nhat
+    data = data.withColumn(
+        "CASA_TREND_3M",
+        when(
+            F.lag("CASA_MAX_BAL_AMT_LCY",2).over(window_spec).isNotNull(),
+            (col("CASA_MAX_BAL_AMT_LCY") - F.lag("CASA_MAX_BAL_AMT_LCY",2).over(window_spec))/2
+        ).otherwise(
+            col("CASA_MAX_BAL_AMT_LCY") - F.lag("CASA_MAX_BAL_AMT_LCY",1).over(window_spec)
+        )
+    )
+
+    # append data with new month into dataset table
+    # data.write\
+    #     .mode("append")\
+    #     .format("hive")\
+    #     .partitionBy("YEARMONTH")\
+    #     .saveAsTable("hive_prod.sandbox.customer_reactive")
+
+    spark.sql("DROP TABLE IF EXISTS hive_prod.sandbox.customer_reactive") # drop if exists
+
+    data.writeTo("hive_prod.sandbox.customer_reactive")\
+        .tableProperty("write.format.default","parquet")\
+        .tableProperty("location","s3a://lpb-dna/silver/sandbox/customer_reactive")\
+        .partitionedBy("YEARMONTH")\
+        .createOrReplace()
+
+def run_modeling():
+    query = f"""
+    SELECT * FROM hive_prod.sandbox.customer_reactive
+    """
+    data = spark.sql(query)
+    data = data.toPandas()
+    data.columns = data.columns.str.upper()
+    # col_convert = ['CREATE_DURATION','MAX_PYMTC_TXN_AMT_FCY','SUM_PYMTC_TXN_AMT_FCY','CASA_SUM_INTAMT','CASA_MAX_BAL_AMT_FCY','CASA_SUM_BAL_AMT_FCY','CASA_MAX_BAL_AMT_LCY','CASA_SUM_BAL_AMT_LCY','LOAN_STATUS','LOAN_MIN_DSBR_AMT','LOAN_MAX_DSBR_AMT','LOAN_SUM_PNP_AMT','LOAN_SUM_INT_AMT','LOAN_MAX_INT_RATE','LOAN_AVG_INT_RATE','LOAN_MAX_DEBT_LOAN','MAX_TXN_AMT_FCY','SUM_TXN_AMT_FCY']
+    # for col in col_convert:
+    #     data[col] = data[col].astype(float)
+
+    data['BRANCHID'] = data['BRANCHID'].map(data['BRANCHID'].value_counts())
+    data.fillna(0,inplace=True)
+    cat_col = ['GENDER','CASA_TERM_CODE','CARD_TYPE','CARD_REISSUE']
+    drop_col = ['CST_NO','YEARMONTH','ELT_DATE']
+    oth_col = [col for col in data.columns if col not in cat_col+drop_col]
+    for col in cat_col:
+        data[col] = data[col].astype(str)
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('category', OneHotEncoder(handle_unknown='ignore'), cat_col),
+            ('numberic', 'passthrough', oth_col)
+        ],
+        remainder='drop'
+    )
+    X_train = data[data['YEARMONTH'].isin(train)].copy()
+    y_train = X_train.pop('LABEL')
+    X_test = data[data['YEARMONTH'].isin(test)].copy()
+    y_test = X_test.pop('LABEL')
+
+    # test with different algothithms
+    scale = np.sum(y_train==0)/np.sum(y_train==1)
+    models = [
+        {
+            "name": "Logistic Regession",
+            "model": LogisticRegression,
+            "params": {
+                "solver": "lbfgs",
+                "max_iter": 1000,
+                "multi_class": "auto",
+                "random_state": 1994,
+                "class_weight": "balanced"
+            }
+        },
+
+        {
+            "name": "Random Forest",
+            "model": RandomForestClassifier,
+            "params": {
+                "n_estimators": 300,
+                "max_depth": 10,
+                "class_weight": "balanced"
+            }
+        },
+
+        {
+            "name": "XGBoost Classifier",
+            "model": XGBClassifier,
+            "params": {
+                "use_label_encoder": True,
+                "eval_metric": "logloss",
+                "scale_pos_weight": scale 
+            }
+        },
+
+        {
+            "name": "LightGBM Classifier",
+            "model": LGBMClassifier,
+            "params":{
+                "boosting": "gbdt",
+                "objective": "binary",
+                "metric": "binary_logloss",
+                "num_iterations": 300,
+                "scale_pos_weight": scale
+            }
+        }
+    ]
+
+    # MLFlow log
+    reports = []
+    for m in models:
+        mlflow.set_experiment(experiment_name)
+        mlflow.autolog() # add auto log, remove if not run as expected
+        with mlflow.start_run(run_name=m["name"]):
+            mlflow.log_param("model_name",m["name"])
+            for k,v in m["params"].items():
+                mlflow.log_param(k,v)        
+
+            model_classifier = m["model"](**m["params"])
+
+            # build model
+            model = Pipeline(steps=[
+                ('preprocessor', preprocessor),
+                ('classifier', model_classifier)
+                ]
+            )
+
+            model.fit(X_train, y_train)
+
+            # test model
+            y_pred = model.predict(X_test)
+
+            report = classification_report(y_test, y_pred, output_dict=True)
+            reports.append(report)
+            AUC = roc_auc_score(y_test, y_pred)
+
+            #log metrics
+            mlflow.log_metric("accuracy", report["accuracy"])
+            mlflow.log_metric("recall_class0", report["0"]["recall"])
+            mlflow.log_metric("recall_class1", report["1"]["recall"])
+            mlflow.log_metric("f1_score_macro", report["macro avg"]["f1-score"])
+            mlflow.log_metric("AUC", AUC)
+
+            mlflow.sklearn.log_model(model, m["name"])
+
+    # get metrics into table result
+    experiment = client.get_experiment_by_name(experiment_name)
+    experiment_id = experiment.experiment_id
+    runs = mlflow.search_runs(experiment_id)
+    df_runs=runs[["artifact_uri","metrics.accuracy","metrics.recall_class1","metrics.recall_class0","metrics.f1_score_macro","metrics.AUC","metrics.training_precision_score","metrics.training_log_loss","params.model_name"]].sort_values("metrics.recall_class0", ascending=False).head(1)
+    df_runs['MODEL_NAME'] = "Customer_Reactive"
+    df_runs['ETL_DATE'] = last_date_month[-1]
+    df_runs['PERFORMANCE_DATE'] = last_date_month[-1]
+    df_runs['LABEL'] = "KPSGD"
+    df_runs['LABEL_COUNT'] = data['KPSGD'].value_counts()[1]
+    df_runs['SAMPLE'] = data.shape[0]
+    df_runs['EXTEND_FIELD'] = None
+    df_runs['TOP_LIFT'] = None
+    df_runs['RECALL'] = None
+    df_runs['KS'] = None
+    df_runs.columns = ["MLFLOW","ACCURACY","RECALL_CLASS1","RECALL_CLASS0","F1","AUC","PRECISION","TRAIN_LOG_LOSS","ALGORITHM","MODEL_NAME","ETL_DATE","PERFORMANCE_DATE","LABEL","LABEL_COUNT","SAMPLE","EXTEND_FIELD",'TOP_LIFT', 'RECALL', 'KS']
+    # insert db
+    def _batch_insert(cursor, sql , data, batch_size=100000):
+                for i in range(0, len(data), batch_size):
+                    chunks = data[i : i + batch_size]
+                    cursor.executemany(sql, chunks)
+
+    required_columns = [
+        "MODEL_NAME", "MLFLOW", "ETL_DATE", "PERFORMANCE_DATE", "TOP_LIFT",
+        "PRECISION", "RECALL", "F1", "AUC", "KS", "LABEL", "LABEL_COUNT",
+        "SAMPLE", "EXTEND_FIELD","RECALL_CLASS1","RECALL_CLASS0","ACCURACY",
+        "TRAIN_LOG_LOSS","ALGORITHM"
+    ]
+
+    data_subset = df_runs[required_columns]
+
+    data_list = list(data_subset.itertuples(index=False, name=None))
+
+    cursor = conn.cursor()
+    delete_sql = f"""
+    DELETE FROM DAD.ML_MODEL_MONITORING 
+    WHERE ETL_DATE = TO_DATE('{last_date_month}', 'YYYY-MM-DD') 
+    AND MODEL_NAME = 'Customer_Reactive'
+    """
+    cursor.execute(delete_sql)
+
+    insert_sql = """
+    INSERT INTO DAD.ML_MODEL_MONITORING  
+    (MODEL_NAME, MLFLOW, ETL_DATE, PERFORMANCE_DATE, TOP_LIFT, PRECISION, 
+    RECALL, F1, AUC, KS, LABEL, LABEL_COUNT, SAMPLE, EXTEND_FIELD,
+    RECALL_CLASS1,RECALL_CLASS0,ACCURACY,TRAIN_LOG_LOSS,ALGORITHM)
+    VALUES (?, ?, TO_DATE(?, 'YYYY-MM-DD'), TO_DATE(?, 'YYYY-MM-DD'), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+
+    # Thực thi batch insert
+    _batch_insert(cursor, insert_sql, data_list)
+
+def run_predict():
+    # Get new input data for prediction
+    query = f"""
+        select * from hive_prod.sandbox.customer_reactive 
+        where YEARMONTH = date_format(TO_DATE('{etl_date}','yyyy-MM-dd'),'yyyyMM')
+        and LABEL = 0
+        """
+    input_df = spark.sql(query)
+    input_df = input_df.toPandas()
+    input_df.columns = input_df.columns.str.upper()
+
+    # Call back model
+    model = get_model(model_name,run_id)
+
+    # predict and return outputs
+    y_pred = model.predict(input_df)
+    y_pred_proba = model.predict_proba(input_df)
+    input_df['proba0'] = y_pred_proba[:,0]
+    input_df['proba1'] = y_pred_proba[:,1]
+    input_df['y_pred'] = y_pred
+
+    result = input_df[['cst_no','yearmonth','proba0','proba1','y_pred','ETL_DATE']].copy()
+
+    required_columns = [
+        'cst_no','yearmonth','proba0','proba1','y_pred','ETL_DATE'
+    ]
+
+    data_subset = result[required_columns]
+    data_list = list(data_subset.itertuples(index=False, name=None))
+
+    insert_sql = """
+    INSERT INTO DAD.ML_CUSTOMER_REACTIVE_LEAD 
+    (CST_NO, YEARMONTH, PROBA0, PROBA1, Y_PRED, ETL_DATE)
+    VALUES (?, ?, ?, ?, ?, TO_DATE(?, 'YYYY-MM-DD'))
+    """
+
+    # Thực thi batch insert
+    _batch_insert(cursor, insert_sql, data_list)
